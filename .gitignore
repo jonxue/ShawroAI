@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 打包产物
+build/
+dist/
+*.spec.bak
+
+# 数据库（含用户聊天记录，不提交）
+*.db
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# 日志
+*.log
+
+# 打包时自动生成的 spec（保留手写的 app.spec）
+DeepSeek AI.spec

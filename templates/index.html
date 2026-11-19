@@ -1228,6 +1228,9 @@
             }
 
             // 构造独立的请求消息（不落库，不污染历史）
+            // 取上一段末尾的锚点（最后 2 行非空内容），明确告知模型从何处继续，避免重复
+            const tailLines = previousContent.split('\n').filter(l => l.trim() !== '');
+            const anchor = tailLines.slice(-2).join('\n');
             const requestMessages = [
                 ...messages,
                 {
@@ -1236,7 +1239,8 @@
                         + '1. 不要重复任何已经输出过的文字、代码或注释；\n'
                         + '2. 不要重新开头、不要总结、不要解释、不要输出任何说明性文字；\n'
                         + '3. 如果内容是在代码块内，直接接着写代码本身，不要添加任何新的注释、不要输出 "继续" "以下是" 等引导语；\n'
-                        + '4. 代码块若尚未闭合，请从最后一行代码之后直接续写，不要重复闭合标记之前的内容。'
+                        + '4. 代码块若尚未闭合，请从最后一行代码之后直接续写，不要重复闭合标记之前的内容；\n'
+                        + (anchor ? `5. 你上一次输出的最后内容如下（仅作位置锚点，绝对不要重复输出这些行）：\n【锚点开始】\n${anchor}\n【锚点结束】\n请从这段锚点之后直接继续。` : '')
                 }
             ];
 
@@ -1328,20 +1332,46 @@
             }
         }
 
-        // 剥离重复前缀：如果 newContent 以 previous 的后缀开头，去掉重复段
+        // 剥离续写时重复/污染的内容：
+        // 1) appended 开头与 previous 尾部重叠 → 去掉重复段
+        // 2) 清理残留的代码块标记（``` 、```python 等），避免拼出杂乱的闭合/重开标记
+        // 3) 若 appended 中间又重复了 previous 的尾部片段，一并剥离
         function stripRepeatedPrefix(previous, appended) {
             if (!appended) return appended;
             // 完全重复（模型把全文重发）
             if (appended === previous) return '';
-            if (appended.startsWith(previous)) return appended.slice(previous.length);
 
-            const maxCheck = Math.min(previous.length, appended.length, 500);
-            for (let len = maxCheck; len > 0; len--) {
-                if (previous.slice(-len) === appended.slice(0, len)) {
-                    return appended.slice(len);
+            let result = appended;
+
+            // —— 1) 前缀重叠剥离（放大到 2000 字符，覆盖长代码行）——
+            if (result.startsWith(previous)) {
+                result = result.slice(previous.length);
+            } else {
+                const maxCheck = Math.min(previous.length, result.length, 2000);
+                for (let len = maxCheck; len > 0; len--) {
+                    if (previous.slice(-len) === result.slice(0, len)) {
+                        result = result.slice(len);
+                        break;
+                    }
                 }
             }
-            return appended;
+
+            // —— 2) 清理开头残留的代码块围栏标记 ——
+            // 形如 "```python" / "```" / "```py" 出现在开头（模型误以为要闭合/重开代码块）
+            result = result.replace(/^\s*```[a-zA-Z0-9_+-]*\s*\n?/, '');
+
+            // —— 3) 若结果中间又整体重复了 previous 的尾部，剥离重复块 ——
+            // 取 previous 最后 300 字符作为“指纹”，若 result 中非开头位置再次出现，说明模型又重发了一段
+            const tailFingerprint = previous.slice(-300);
+            if (tailFingerprint && tailFingerprint.length >= 20) {
+                const idx = result.indexOf(tailFingerprint, 1); // 从第 2 个字符起查找
+                if (idx > 0) {
+                    // 从重复指纹处截断，保留指纹之前的新内容
+                    result = result.slice(0, idx);
+                }
+            }
+
+            return result;
         }
 
         // ================= 会话加载进度条 =================

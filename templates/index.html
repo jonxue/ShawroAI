@@ -187,8 +187,9 @@
                         </button>
                         <input type="file" id="file-input" multiple class="hidden" onchange="handleFileSelect(event)" accept=".png,.jpg,.jpeg,.webp,.txt,.py,.md,.json,.csv">
                     </div>
-                    <button id="send-btn" onclick="sendMessage()" class="bg-ds-accent text-white p-2 rounded-lg hover:bg-blue-600 transition disabled:opacity-50 disabled:cursor-not-allowed">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                    <button id="send-btn" onclick="onSendBtnClick()" class="bg-ds-accent text-white p-2 rounded-lg hover:bg-blue-600 transition disabled:opacity-50 disabled:cursor-not-allowed">
+                        <svg id="send-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                        <svg id="stop-icon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" class="hidden"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
                     </button>
                 </div>
             </div>
@@ -255,6 +256,7 @@
         let currentCodeToSave = '';
         let streamBuffer = '';
         let updateTimer = null;
+        let abortController = null;       // 用于中断正在进行的对话流
         const enhancedPres = new WeakSet();
         let userMsgSeq = 0;               // 用户消息序号（用于索引定位）
         const userMsgIndex = [];          // 客户消息索引：{seq, text, domId}
@@ -1026,6 +1028,35 @@
         }
 
         // ================= 核心：发送消息 =================
+        // 发送按钮统一入口：流式生成中点击即停止，否则发送
+        function onSendBtnClick() {
+            if (isStreaming) {
+                stopStreaming();
+            } else {
+                sendMessage();
+            }
+        }
+
+        // 切换发送按钮图标（发送 ⇄ 停止）
+        function setStreamingState(streaming) {
+            const sendIcon = document.getElementById('send-icon');
+            const stopIcon = document.getElementById('stop-icon');
+            const btn = document.getElementById('send-btn');
+            if (sendIcon) sendIcon.classList.toggle('hidden', streaming);
+            if (stopIcon) stopIcon.classList.toggle('hidden', !streaming);
+            if (btn) {
+                btn.classList.toggle('bg-red-500', streaming);
+                btn.classList.toggle('bg-ds-accent', !streaming);
+            }
+        }
+
+        // 中断正在进行的流式生成
+        function stopStreaming() {
+            if (abortController) {
+                try { abortController.abort(); } catch (e) {}
+            }
+        }
+
         async function sendMessage() {
             if (isStreaming) return;
             const inputBox = document.getElementById('input-box');
@@ -1044,8 +1075,10 @@
             renderAttachments();
             inputBox.value = '';
             autoResize(inputBox);
-            document.getElementById('send-btn').disabled = true;
+            document.getElementById('send-btn').disabled = false;
             isStreaming = true;
+            setStreamingState(true);
+            abortController = new AbortController();
 
             const container = document.getElementById('chat-container');
             if (container.querySelector('.text-center')) container.innerHTML = '';
@@ -1089,7 +1122,8 @@
                         workspace: document.getElementById('workspace-path').value.trim(),
                         attachments: buildAttachmentsPayload(atts),
                         is_continue: false
-                    })
+                    }),
+                    signal: abortController.signal
                 });
 
                 finishReason = await readSSEStream(response, (delta) => {
@@ -1098,6 +1132,21 @@
                 });
 
                 if (updateTimer) { clearInterval(updateTimer); updateTimer = null; }
+
+                if (abortController.signal.aborted) {
+                    // 用户主动停止：保留已生成内容，不报错
+                    if (fullReply) {
+                        messages.push({ role: 'assistant', content: fullReply });
+                        bubble.innerHTML = renderMarkdown(fullReply);
+                        try { hljs.highlightAll(); } catch (e) {}
+                        enhanceCodeBlocks(bubble);
+                        loadSessions();
+                    } else {
+                        bubble.innerHTML = '<span class="text-gray-500">已停止生成</span>';
+                        messages.pop();
+                    }
+                    return;
+                }
 
                 if (!fullReply) {
                     bubble.innerHTML = '<span class="text-red-400">未收到回复</span>';
@@ -1117,10 +1166,19 @@
                 loadWorkspaceFiles();
             } catch (error) {
                 if (updateTimer) { clearInterval(updateTimer); updateTimer = null; }
-                messages.pop();
-                bubble.innerHTML = `<span class="text-red-400">Error: ${escapeHtml(error.message)}</span>`;
+                // 用户主动中止：静默处理，不弹出错误
+                if (error.name === 'AbortError' || abortController?.signal.aborted) {
+                    if (!fullReply && bubble) {
+                        bubble.innerHTML = '<span class="text-gray-500">已停止生成</span>';
+                    }
+                } else {
+                    messages.pop();
+                    bubble.innerHTML = `<span class="text-red-400">Error: ${escapeHtml(error.message)}</span>`;
+                }
             } finally {
                 isStreaming = false;
+                abortController = null;
+                setStreamingState(false);
                 document.getElementById('send-btn').disabled = false;
             }
         }
@@ -1157,13 +1215,15 @@
         async function continueGeneration(previousContent, parentBubble) {
             if (isStreaming) return;
             isStreaming = true;
-            document.getElementById('send-btn').disabled = true;
+            abortController = new AbortController();
+            setStreamingState(true);
 
             // 显式记录最后一条 assistant 索引
             const assistantIdx = messages.length - 1;
             if (assistantIdx < 0 || messages[assistantIdx].role !== 'assistant') {
                 isStreaming = false;
-                document.getElementById('send-btn').disabled = false;
+                abortController = null;
+                setStreamingState(false);
                 return;
             }
 
@@ -1212,7 +1272,8 @@
                         workspace: document.getElementById('workspace-path').value.trim(),
                         attachments: [],
                         is_continue: true
-                    })
+                    }),
+                    signal: abortController.signal
                 });
 
                 await readSSEStream(response, (delta) => {
@@ -1238,13 +1299,31 @@
                 loadSessions();
             } catch (error) {
                 if (updateTimer) { clearInterval(updateTimer); updateTimer = null; }
-                parentBubble.innerHTML = renderMarkdown(previousContent);
-                const err = document.createElement('div');
-                err.className = 'text-red-400 mt-2';
-                err.textContent = 'Error: ' + error.message;
-                parentBubble.appendChild(err);
+                if (error.name === 'AbortError' || abortController?.signal.aborted) {
+                    // 用户主动中止：保留已生成部分
+                    if (newContent) {
+                        let appended = stripRepeatedPrefix(previousContent, newContent);
+                        if (!appended && newContent) appended = newContent;
+                        const fullReply = previousContent + appended;
+                        messages[assistantIdx] = { role: 'assistant', content: fullReply };
+                        parentBubble.innerHTML = renderMarkdown(fullReply);
+                        try { hljs.highlightAll(); } catch (e) {}
+                        enhanceCodeBlocks(parentBubble);
+                        loadSessions();
+                    } else {
+                        parentBubble.innerHTML = renderMarkdown(previousContent);
+                    }
+                } else {
+                    parentBubble.innerHTML = renderMarkdown(previousContent);
+                    const err = document.createElement('div');
+                    err.className = 'text-red-400 mt-2';
+                    err.textContent = 'Error: ' + error.message;
+                    parentBubble.appendChild(err);
+                }
             } finally {
                 isStreaming = false;
+                abortController = null;
+                setStreamingState(false);
                 document.getElementById('send-btn').disabled = false;
             }
         }

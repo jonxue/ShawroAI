@@ -168,7 +168,16 @@ build.bat
 
 生成 `dist\Shawro AI.exe`（带长颈鹿图标）。
 
-> **注意**：PyInstaller 不支持跨平台打包，`.exe` 必须在 Windows 环境打包，`.app` 必须在 macOS 环境打包。
+### 用 GitHub Actions 云端打包 Windows 版（无需 Windows 机器）
+
+本项目已配置 `.github/workflows/build-windows.yml`，可以借助 GitHub 云端直接打包 `.exe`：
+
+1. 把代码推送到 GitHub 仓库的 `main` 分支（或手动触发）。
+2. 打开仓库的 **Actions** 页面，运行「Build Windows EXE」工作流。
+3. 打包完成后，在运行记录底部的 **Artifacts** 里下载 `ShawroAI-Windows`（内含 `.exe`）。
+4. 如果推送的是 `v` 开头的 tag（如 `v1.0.0`），会自动创建 **Release** 并附带 `.exe` 供下载。
+
+> **注意**：PyInstaller 不支持跨平台打包，`.exe` 必须在 Windows 环境打包，`.app` 必须在 macOS 环境打包。GitHub Actions 的 `windows-latest` runner 正好解决了没有 Windows 机器的问题。
 
 ### 打包说明
 

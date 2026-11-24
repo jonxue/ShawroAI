@@ -1228,20 +1228,33 @@
             }
 
             // 构造独立的请求消息（不落库，不污染历史）
-            // 取上一段末尾的锚点（最后 2 行非空内容），明确告知模型从何处继续，避免重复
+            // 判断上一段是否含代码块围栏，据此区分「代码续写」与「文本续写」
+            const hasCodeFence = /```/.test(previousContent);
             const tailLines = previousContent.split('\n').filter(l => l.trim() !== '');
             const anchor = tailLines.slice(-2).join('\n');
+
+            let continueInstruction;
+            if (hasCodeFence) {
+                // 代码续写：用末尾锚点精确定位，禁止重复
+                continueInstruction =
+                    '请严格从你上一次回复中断的地方，紧接着继续输出剩余内容。要求：\n'
+                    + '1. 不要重复任何已经输出过的文字、代码或注释；\n'
+                    + '2. 不要重新开头、不要总结、不要解释、不要输出任何说明性文字；\n'
+                    + '3. 直接接着写代码本身，不要添加新的注释，不要输出 "继续" "以下是" 等引导语；\n'
+                    + '4. 不要输出 ``` 或 ```python 等围栏标记；\n'
+                    + (anchor ? `5. 你上一次输出的最后内容如下（仅作位置锚点，绝对不要重复输出这些行）：\n【锚点开始】\n${anchor}\n【锚点结束】\n请从这段锚点之后直接继续。` : '');
+            } else {
+                // 文本续写：不给锚点，只要求自然地接着写，避免模型重复上一段结尾
+                continueInstruction =
+                    '请自然地接着你上一次的回复继续往下写，把没说完的内容讲完整。要求：\n'
+                    + '1. 不要重复上一段已经写过的句子；\n'
+                    + '2. 不要重新开头、不要总结、不要解释，直接续写正文；\n'
+                    + '3. 保持与上一段相同的语气、风格和格式（列表/标题/段落结构一致）。';
+            }
+
             const requestMessages = [
                 ...messages,
-                {
-                    role: 'user',
-                    content: '请严格从你上一次回复中断的地方，紧接着继续输出剩余内容。要求：\n'
-                        + '1. 不要重复任何已经输出过的文字、代码或注释；\n'
-                        + '2. 不要重新开头、不要总结、不要解释、不要输出任何说明性文字；\n'
-                        + '3. 如果内容是在代码块内，直接接着写代码本身，不要添加任何新的注释、不要输出 "继续" "以下是" 等引导语；\n'
-                        + '4. 代码块若尚未闭合，请从最后一行代码之后直接续写，不要重复闭合标记之前的内容；\n'
-                        + (anchor ? `5. 你上一次输出的最后内容如下（仅作位置锚点，绝对不要重复输出这些行）：\n【锚点开始】\n${anchor}\n【锚点结束】\n请从这段锚点之后直接继续。` : '')
-                }
+                { role: 'user', content: continueInstruction }
             ];
 
             const pre = document.createElement('pre');
@@ -1288,8 +1301,23 @@
                 if (updateTimer) { clearInterval(updateTimer); updateTimer = null; }
 
                 // 去重兜底：剥离与已有内容重复的前缀
-                let appended = stripRepeatedPrefix(previousContent, newContent);
-                if (!appended && newContent) appended = newContent; // 极端情况下不丢弃
+                const appended = stripRepeatedPrefix(previousContent, newContent);
+
+                // 续写没有产生有效的新内容：给出明确反馈，而不是静默显示原内容
+                if (!newContent || !appended.trim()) {
+                    messages[assistantIdx] = { role: 'assistant', content: previousContent };
+                    parentBubble.innerHTML = renderMarkdown(previousContent);
+                    try { hljs.highlightAll(); } catch (e) {}
+                    enhanceCodeBlocks(parentBubble);
+                    const hint = document.createElement('div');
+                    hint.className = 'text-xs text-gray-500 mt-2';
+                    hint.textContent = newContent
+                        ? '⚠️ 续写内容与上文重复，已忽略（未产生新内容）'
+                        : '⚠️ 模型未返回新的续写内容';
+                    parentBubble.appendChild(hint);
+                    loadSessions();
+                    return;
+                }
 
                 const fullReply = previousContent + appended;
                 messages[assistantIdx] = { role: 'assistant', content: fullReply };
@@ -1305,9 +1333,8 @@
                 if (updateTimer) { clearInterval(updateTimer); updateTimer = null; }
                 if (error.name === 'AbortError' || abortController?.signal.aborted) {
                     // 用户主动中止：保留已生成部分
-                    if (newContent) {
-                        let appended = stripRepeatedPrefix(previousContent, newContent);
-                        if (!appended && newContent) appended = newContent;
+                    const appended = stripRepeatedPrefix(previousContent, newContent);
+                    if (newContent && appended.trim()) {
                         const fullReply = previousContent + appended;
                         messages[assistantIdx] = { role: 'assistant', content: fullReply };
                         parentBubble.innerHTML = renderMarkdown(fullReply);
@@ -1334,8 +1361,9 @@
 
         // 剥离续写时重复/污染的内容：
         // 1) appended 开头与 previous 尾部重叠 → 去掉重复段
-        // 2) 清理残留的代码块标记（``` 、```python 等），避免拼出杂乱的闭合/重开标记
-        // 3) 若 appended 中间又重复了 previous 的尾部片段，一并剥离
+        // 2) 清理开头残留的代码块标记（``` 、```python 等），避免拼出杂乱的闭合/重开标记
+        // 注意：只做「前缀/首行」级别的去重，绝不做「中间指纹截断」——
+        //       后者会误伤正常的文本续写（模型自然地呼应上一段用词时被错误截断，导致内容为空）。
         function stripRepeatedPrefix(previous, appended) {
             if (!appended) return appended;
             // 完全重复（模型把全文重发）
@@ -1358,18 +1386,8 @@
 
             // —— 2) 清理开头残留的代码块围栏标记 ——
             // 形如 "```python" / "```" / "```py" 出现在开头（模型误以为要闭合/重开代码块）
+            // 只在结果开头清理，不触碰正文中合法出现的围栏
             result = result.replace(/^\s*```[a-zA-Z0-9_+-]*\s*\n?/, '');
-
-            // —— 3) 若结果中间又整体重复了 previous 的尾部，剥离重复块 ——
-            // 取 previous 最后 300 字符作为“指纹”，若 result 中非开头位置再次出现，说明模型又重发了一段
-            const tailFingerprint = previous.slice(-300);
-            if (tailFingerprint && tailFingerprint.length >= 20) {
-                const idx = result.indexOf(tailFingerprint, 1); // 从第 2 个字符起查找
-                if (idx > 0) {
-                    // 从重复指纹处截断，保留指纹之前的新内容
-                    result = result.slice(0, idx);
-                }
-            }
 
             return result;
         }
